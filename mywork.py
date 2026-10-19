@@ -44,7 +44,12 @@ Config: ~/.config/mywork/config.toml
   [[repo]] path, name, pinned settings for one repo
   [review_agent] login, started
                               PR comment author and "review started" text of a
-                              review bot; enables the review colors"""
+                              review bot; enables the review colors
+  [[workflow]] url            GitHub API URL listing workflow runs, e.g.
+                              repos/OWNER/REPO/actions/workflows/FILE/runs?branch=master&per_page=1;
+                              the newest run is shown as a bar on top"""
+
+WORKFLOW_HELP = "Bar on top: newest workflow run; blue running, green passed, red failed"
 
 
 def run(args, cwd):
@@ -133,6 +138,28 @@ def pr_color(prs):
     return "waiting" if prs else None
 
 
+def load_workflows():
+    with CONFIG.open("rb") as f:
+        return [w["url"] for w in tomllib.load(f).get("workflow", [])]
+
+
+def workflow_status(url):
+    """Return (text, tag, url) for the newest run listed by a GitHub API workflow runs URL."""
+    try:
+        runs = json.loads(run(["gh", "api", url], Path.cwd()))["workflow_runs"]
+    except RuntimeError as e:
+        return f"{url}: error: {e}", None, None
+    if not runs:
+        return f"{url}: no runs", None, None
+    r = runs[0]
+    if r["status"] != "completed":
+        tag = "running"
+    else:
+        tag = "approved" if r["conclusion"] == "success" else "failed"  # green or red
+    text = f"{r['repository']['full_name']} {r['name']} ({r['head_branch']})"
+    return f"{text}: {r['display_title']}", tag, r["html_url"]
+
+
 def load_dirs():
     if not CONFIG.exists():
         sys.exit(f"Missing config: {CONFIG}")
@@ -199,6 +226,11 @@ class App:
         menubar.add_cascade(label="Help", menu=help_menu)
         root.configure(menu=menubar)
 
+        self.bar = ttk.Frame(root)
+        self.bar.pack(fill="x")
+        self.workflows = []
+        self.runs = []
+
         self.tree = ttk.Treeview(root, columns=("dir", "branch", "prs", "comment"), show="headings")
         for col, label, width in (("dir", "Directory", 150), ("branch", "Branch", 300),
                                   ("prs", "PRs", 100), ("comment", "Comment", 300)):
@@ -234,19 +266,23 @@ class App:
     def _refresh_active(self):
         dirs, rows = self.last
         active = [d for d, (_, color, _) in zip(dirs, rows) if color in ACTIVE]
-        if active and not self.fetching:
+        workflows = self.workflows if any(tag == "running" for _, tag, _ in self.runs) else None
+        if (active or workflows) and not self.fetching:
             self.fetching = True
-            threading.Thread(target=self._fetch_active, args=(active,), daemon=True).start()
+            threading.Thread(target=self._fetch_active, args=(active, workflows),
+                             daemon=True).start()
         self.root.after(ACTIVE_REFRESH_MS, self._refresh_active)
 
-    def _fetch_active(self, active):
+    def _fetch_active(self, active, workflows):
         with ThreadPoolExecutor() as pool:
+            runs = pool.map(workflow_status, workflows) if workflows else None
             updated = dict(zip((path for _, path, _ in active), pool.map(status, active)))
-        self.root.after(0, self._show_active, updated)
+            runs = list(runs) if runs else None
+        self.root.after(0, self._show_active, updated, runs)
 
-    def _show_active(self, updated):
+    def _show_active(self, updated, runs):
         dirs, rows = self.last
-        self._show(dirs, [updated.get(path, row) for (_, path, _), row in zip(dirs, rows)])
+        self._show(dirs, [updated.get(path, row) for (_, path, _), row in zip(dirs, rows)], runs)
 
     def _check_comments(self):
         mtime = COMMENTS.stat().st_mtime if COMMENTS.exists() else None
@@ -264,14 +300,17 @@ class App:
         self.button.state(["disabled"])
         try:
             self.dirs = load_dirs()
+            self.workflows = load_workflows()
         except (OSError, ValueError, KeyError):
             pass  # Keep the last good config while the file is broken or mid-edit.
-        threading.Thread(target=self._fetch, args=(self.dirs,), daemon=True).start()
+        threading.Thread(target=self._fetch, args=(self.dirs, self.workflows), daemon=True).start()
 
-    def _fetch(self, dirs):
+    def _fetch(self, dirs, workflows):
         with ThreadPoolExecutor() as pool:
+            runs = pool.map(workflow_status, workflows)
             rows = list(pool.map(status, dirs))
-        self.root.after(0, self._show, dirs, rows)
+            runs = list(runs)
+        self.root.after(0, self._show, dirs, rows, runs)
 
     def _show_colors(self):
         win = tk.Toplevel(self.root)
@@ -282,18 +321,35 @@ class App:
             tk.Label(win, text=label).grid(row=i, column=1, sticky="w")
             tk.Label(win, text=meaning).grid(row=i, column=2, sticky="w", padx=6)
         tk.Label(win, text="No color: no PR, or on master/main", foreground="#555").grid(
-            row=len(STATES), column=0, columnspan=3, sticky="w", padx=6, pady=(6, 6))
+            row=len(STATES), column=0, columnspan=3, sticky="w", padx=6, pady=(6, 0))
+        tk.Label(win, text=WORKFLOW_HELP, foreground="#555").grid(
+            row=len(STATES) + 1, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
 
     def _toggle_hidden(self):
         self.show_all = not self.show_all
         self.toggle.configure(text="Hide idle" if self.show_all else "Show all")
         self._render()
 
-    def _show(self, dirs, rows):
+    def _show(self, dirs, rows, runs=None):
         self.last = (dirs, rows)
+        if runs is not None:
+            self.runs = runs
+            self._render_bar()
         self._render()
         self.fetching = False
         self.button.state(["!disabled"])
+
+    def _render_bar(self):
+        colors = {tag: color for tag, color, _, _ in STATES}
+        for child in self.bar.winfo_children():
+            child.destroy()
+        for text, tag, url in self.runs:
+            label = tk.Label(self.bar, text=text, anchor="w", padx=6,
+                             background=colors.get(tag, self.bar.winfo_toplevel()["background"]))
+            label.pack(fill="x")
+            if url:
+                label.configure(cursor="hand2")
+                label.bind("<Button-1>", lambda _, url=url: webbrowser.open(url))
 
     def _render(self):
         self.tree.delete(*self.tree.get_children())
@@ -356,6 +412,7 @@ def print_help():
         r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
         print(f"  \033[48;2;{r};{g};{b}m    \033[0m {label:<11} {meaning}")
     print("  No color: no PR, or on master/main")
+    print(f"\n{WORKFLOW_HELP}")
 
 
 def main():
