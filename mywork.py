@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import tomllib
 import webbrowser
@@ -47,7 +48,10 @@ Config: ~/.config/mywork/config.toml
                               review bot; enables the review colors
   [[workflow]] url            GitHub API URL listing workflow runs, e.g.
                               repos/OWNER/REPO/actions/workflows/FILE/runs?branch=master&per_page=1;
-                              the newest run is shown as a bar on top"""
+                              the newest run is shown as a bar on top
+  [work_hours] days, start, end
+                              e.g. ["Mon", "Tue"], "06:30", "16:00" (local time);
+                              outside these, only refresh with the button"""
 
 WORKFLOW_HELP = "Bar on top: newest workflow run; blue running, green passed, red failed"
 
@@ -57,6 +61,42 @@ def run(args, cwd):
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"{args[0]} failed")
     return result.stdout.strip()
+
+
+# Asks only for what pr_color needs. "gh pr list --json commits" also fetches 100 authors
+# for each of 100 commits, which GitHub prices high enough to exhaust the hourly limit.
+PR_QUERY = """
+query($owner: String!, $repo: String!, $branch: String!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequests(headRefName: $branch, first: 10) {
+      nodes {
+        number url state reviewDecision
+        comments(last: 100) { nodes { author { login } body createdAt } }
+        commits(last: 1) { nodes { commit {
+          committedDate
+          statusCheckRollup { contexts(first: 100) { nodes {
+            ... on StatusContext { state }
+            ... on CheckRun { status conclusion }
+          } } }
+        } } }
+      }
+    }
+  }
+}"""
+
+
+def fetch_prs(branch, path):
+    """Return the PRs from branch, shaped like "gh pr list --json" output."""
+    out = run(["gh", "api", "graphql", "-f", f"query={PR_QUERY}", "-F", "owner={owner}",
+               "-F", "repo={repo}", "-f", f"branch={branch}"], path)
+    prs = json.loads(out)["data"]["repository"]["pullRequests"]["nodes"]
+    for pr in prs:
+        commits = [n["commit"] for n in pr["commits"]["nodes"]]
+        rollup = commits[-1]["statusCheckRollup"] if commits else None
+        pr["statusCheckRollup"] = rollup["contexts"]["nodes"] if rollup else []
+        pr["comments"] = pr["comments"]["nodes"]
+        pr["commits"] = commits
+    return prs
 
 
 def status(repo):
@@ -69,9 +109,7 @@ def status(repo):
     if branch in ("master", "main"):
         return (name, branch, "–", comment), None, []
     try:
-        out = run(["gh", "pr", "list", "--head", branch, "--state", "all",
-                   "--json", "number,url,state,reviewDecision,statusCheckRollup,comments,commits"], path)
-        all_prs = json.loads(out)
+        all_prs = fetch_prs(branch, path)
     except RuntimeError as e:
         return (name, branch, f"error: {e}", comment), None, []
     prs = [p for p in all_prs if p["state"] == "OPEN"]
@@ -158,6 +196,21 @@ def workflow_status(url):
         tag = "approved" if r["conclusion"] == "success" else "failed"  # green or red
     text = f"{r['repository']['full_name']} {r['name']} ({r['head_branch']})"
     return f"{text}: {r['display_title']}", tag, r["html_url"]
+
+
+def in_work_hours():
+    """Return whether now is inside [work_hours], or True if it is not set."""
+    try:
+        with CONFIG.open("rb") as f:
+            hours = tomllib.load(f).get("work_hours")
+        if not hours:
+            return True
+        # Not strftime("%a"), since Tk may switch the locale and translate day names.
+        now = time.localtime()
+        day = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][now.tm_wday]
+        return day in hours["days"] and hours["start"] <= f"{now.tm_hour:02}:{now.tm_min:02}" < hours["end"]
+    except (OSError, ValueError, KeyError):
+        return True
 
 
 def load_dirs():
@@ -255,19 +308,21 @@ class App:
         self.last = ([], [])
         self.fetching = False
         self.comments_mtime = None
-        self._auto_refresh()
+        self.refresh()
+        self.root.after(REFRESH_MS, self._auto_refresh)
         self.root.after(ACTIVE_REFRESH_MS, self._refresh_active)
         self._check_comments()
 
     def _auto_refresh(self):
-        self.refresh()
+        if in_work_hours():
+            self.refresh()
         self.root.after(REFRESH_MS, self._auto_refresh)
 
     def _refresh_active(self):
         dirs, rows = self.last
         active = [d for d, (_, color, _) in zip(dirs, rows) if color in ACTIVE]
         workflows = self.workflows if any(tag == "running" for _, tag, _ in self.runs) else None
-        if (active or workflows) and not self.fetching:
+        if (active or workflows) and not self.fetching and in_work_hours():
             self.fetching = True
             threading.Thread(target=self._fetch_active, args=(active, workflows),
                              daemon=True).start()
