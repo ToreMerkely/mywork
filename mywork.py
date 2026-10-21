@@ -26,7 +26,7 @@ ACTIVE = {"running", "findings", "failed"}
 # Row colors in the order work usually goes through them: (tag, color, label, meaning).
 STATES = [
     ("running", "#9ec5fe", "Blue", "Review agent or CI checks are running"),
-    ("findings", "#ffb066", "Orange", "Review agent reported findings"),
+    ("findings", "#ffb066", "Orange", "Review agent reported findings, or a review comment is unresolved"),
     ("failed", "#ff8a8a", "Red", "A CI check failed"),
     ("waiting", "#bdbdbd", "Gray", "Checks pass, review clean, waiting for approval"),
     ("approved", "#8fe39a", "Green", "PR approved"),
@@ -72,6 +72,7 @@ query($owner: String!, $repo: String!, $branch: String!) {
       nodes {
         number url state reviewDecision
         comments(last: 100) { nodes { author { login } body createdAt } }
+        reviewThreads(first: 100) { nodes { isResolved } }
         commits(last: 1) { nodes { commit {
           committedDate
           statusCheckRollup { contexts(first: 100) { nodes {
@@ -95,6 +96,7 @@ def fetch_prs(branch, path):
         rollup = commits[-1]["statusCheckRollup"] if commits else None
         pr["statusCheckRollup"] = rollup["contexts"]["nodes"] if rollup else []
         pr["comments"] = pr["comments"]["nodes"]
+        pr["reviewThreads"] = pr["reviewThreads"]["nodes"]
         pr["commits"] = commits
     return prs
 
@@ -165,7 +167,7 @@ def pr_color(prs):
     reviews = [review_state(p, agent) for p in prs]
     if any(c.get("conclusion") in FAILED or c.get("state") in FAILED for c in checks):
         return "failed"
-    if "findings" in reviews:
+    if "findings" in reviews or any(not t["isResolved"] for p in prs for t in p["reviewThreads"]):
         return "findings"
     if "running" in reviews or any(
             c.get("status", "COMPLETED") != "COMPLETED" or c.get("state") in ("PENDING", "EXPECTED")
