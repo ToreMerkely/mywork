@@ -402,6 +402,8 @@ class App:
             label = tk.Label(self.bar, text=text, anchor="w", padx=6,
                              background=colors.get(tag, self.bar.winfo_toplevel()["background"]))
             label.pack(fill="x")
+            label.bind("<Enter>", lambda e, label=label: self._on_bar_enter(label, e))
+            label.bind("<Leave>", lambda _: self._hide_tip())
             if url:
                 label.configure(cursor="hand2")
                 label.bind("<Button-1>", lambda _, url=url: webbrowser.open(url))
@@ -444,6 +446,22 @@ class App:
         padding = 12
         if tkfont.nametofont("TkDefaultFont").measure(text) + padding <= self.tree.column(col, "width"):
             return
+        self._open_tip(text, x, y)
+
+    def _on_bar_enter(self, label, event):
+        self._hide_tip()
+        self.tip_job = self.root.after(500, self._show_bar_tip, label, event.x_root, event.y_root)
+
+    def _show_bar_tip(self, label, x, y):
+        """Show the full bar line near the pointer, if the window cuts it off."""
+        self.tip_job = None
+        text = label["text"]
+        padding = 2 * int(label["padx"])
+        if tkfont.Font(font=label["font"]).measure(text) + padding <= label.winfo_width():
+            return
+        self._open_tip(text, x, y)
+
+    def _open_tip(self, text, x, y):
         self.tip = tk.Toplevel(self.root)
         self.tip.overrideredirect(True)
         self.tip.geometry(f"+{x + 12}+{y + 12}")
