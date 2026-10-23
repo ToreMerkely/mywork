@@ -275,6 +275,9 @@ class App:
         self.root = root
         self.dirs = dirs
         root.title("mywork")
+        icon = Path(__file__).resolve().with_name("mywork.png")
+        if icon.exists():
+            root.iconphoto(True, tk.PhotoImage(file=icon))
         menubar = tk.Menu(root)
         help_menu = tk.Menu(menubar, tearoff=False)
         help_menu.add_command(label="Colors", command=self._show_colors)

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=mywork
+Comment=Overview of branches, PRs and review state across local repos
+Exec=mywork
+Icon=mywork
+Terminal=false
+Categories=Development;Utility;
+StartupWMClass=Mywork
