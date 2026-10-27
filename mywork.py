@@ -51,7 +51,9 @@ Config: ~/.config/mywork/config.toml
                               the newest run is shown as a bar on top
   [work_hours] days, start, end
                               e.g. ["Mon", "Tue"], "06:30", "16:00" (local time);
-                              outside these, only refresh with the button"""
+                              outside these, only refresh with the button
+  issue_url                   e.g. "https://github.com/OWNER/REPO/issues/{}";
+                              links branches named NUMBER-... to that issue"""
 
 WORKFLOW_HELP = "Bar on top: newest workflow run; blue running, green passed, red failed"
 
@@ -128,6 +130,8 @@ FAILED = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STAR
 
 FINDINGS = re.compile(r"(\d+) finding\(s\), verdict:")
 
+ISSUE_BRANCH = re.compile(r"(\d+)-")
+
 
 def load_review_agent():
     """Return the review bot's (login, started text) from the config, or None if not set."""
@@ -181,6 +185,11 @@ def pr_color(prs):
 def load_workflows():
     with CONFIG.open("rb") as f:
         return [w["url"] for w in tomllib.load(f).get("workflow", [])]
+
+
+def load_issue_url():
+    with CONFIG.open("rb") as f:
+        return tomllib.load(f).get("issue_url")
 
 
 def workflow_status(url):
@@ -302,6 +311,7 @@ class App:
         self.tree.bind("<Leave>", lambda _: self._hide_tip())
         self.tip = self.tip_job = self.tip_cell = None
         self.urls = {}
+        self.issue_url = None
 
         buttons = ttk.Frame(root)
         buttons.pack(pady=4)
@@ -361,6 +371,7 @@ class App:
         try:
             self.dirs = load_dirs()
             self.workflows = load_workflows()
+            self.issue_url = load_issue_url()
         except (OSError, ValueError, KeyError):
             pass  # Keep the last good config while the file is broken or mid-edit.
         threading.Thread(target=self._fetch, args=(self.dirs, self.workflows), daemon=True).start()
@@ -423,17 +434,23 @@ class App:
             self.tree.insert("", "end", iid=str(path), values=row, tags=tags)
             self.urls[str(path)] = urls
 
-    def _pr_urls_at(self, event):
-        if self.tree.identify_column(event.x) != "#3":  # PRs column
-            return []
-        return self.urls.get(self.tree.identify_row(event.y), [])
+    def _urls_at(self, event):
+        """Return the URLs the cell under the pointer links to: its PRs, or the issue
+        of a branch named "<number>-..."."""
+        iid, col = self.tree.identify_row(event.y), self.tree.identify_column(event.x)
+        if col == "#3":  # PRs column
+            return self.urls.get(iid, [])
+        if col == "#2" and iid and self.issue_url:  # Branch column
+            if m := ISSUE_BRANCH.match(self.tree.set(iid, "branch")):
+                return [self.issue_url.format(m[1])]
+        return []
 
     def _on_click(self, event):
-        for url in self._pr_urls_at(event):
+        for url in self._urls_at(event):
             webbrowser.open(url)
 
     def _on_motion(self, event):
-        self.tree.configure(cursor="hand2" if self._pr_urls_at(event) else "")
+        self.tree.configure(cursor="hand2" if self._urls_at(event) else "")
         cell = (self.tree.identify_row(event.y), self.tree.identify_column(event.x))
         if cell != self.tip_cell:
             self._hide_tip()

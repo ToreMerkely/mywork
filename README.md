@@ -37,6 +37,8 @@ Or run `mywork add` inside a repo to append it to the config.
 Optional sections:
 
 ```toml
+issue_url = "https://github.com/OWNER/REPO/issues/{}"  # links branches named NUMBER-... to that issue
+
 [review_agent]               # a review bot whose PR comments set the review colors
 login = "my-review-bot"
 started = "Review started"
