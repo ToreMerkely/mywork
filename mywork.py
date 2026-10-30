@@ -70,7 +70,7 @@ def run(args, cwd):
 PR_QUERY = """
 query($owner: String!, $repo: String!, $branch: String!) {
   repository(owner: $owner, name: $repo) {
-    pullRequests(headRefName: $branch, first: 10) {
+    pullRequests(headRefName: $branch, first: 1, orderBy: {field: CREATED_AT, direction: DESC}) {
       nodes {
         number url state reviewDecision
         comments(last: 100) { nodes { author { login } body createdAt } }
@@ -89,7 +89,8 @@ query($owner: String!, $repo: String!, $branch: String!) {
 
 
 def fetch_prs(branch, path):
-    """Return the PRs from branch, shaped like "gh pr list --json" output."""
+    """Return the newest PR from branch, shaped like "gh pr list --json" output.
+    Branch names get reused, so older PRs from the same name are left out."""
     out = run(["gh", "api", "graphql", "-f", f"query={PR_QUERY}", "-F", "owner={owner}",
                "-F", "repo={repo}", "-f", f"branch={branch}"], path)
     prs = json.loads(out)["data"]["repository"]["pullRequests"]["nodes"]
