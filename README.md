@@ -38,6 +38,8 @@ Optional sections:
 
 ```toml
 issue_url = "https://github.com/OWNER/REPO/issues/{}"  # links branches named NUMBER-... to that issue
+approval_org = "OWNER"      # runs waiting for environment approval in this org, shown below the bar;
+                             # repos with required reviewers are rescanned nightly
 
 [review_agent]               # a review bot whose PR comments set the review colors
 login = "my-review-bot"

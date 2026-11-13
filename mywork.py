@@ -17,6 +17,9 @@ from tkinter import font as tkfont, ttk
 CONFIG = Path("~/.config/mywork/config.toml").expanduser()
 COMMENTS = CONFIG.parent / "comments.json"
 WINDOW = CONFIG.parent / "window.json"
+APPROVAL_REPOS = CONFIG.parent / "approval_repos.json"
+# The repo list is rescanned outside work hours once it is older than this.
+APPROVAL_SCAN_AGE = 20 * 3600
 REFRESH_MS = 60_000
 COMMENT_CHECK_MS = 2_000
 # Rows in these states are refreshed more often, since they change while you work on them.
@@ -53,9 +56,12 @@ Config: ~/.config/mywork/config.toml
                               e.g. ["Mon", "Tue"], "06:30", "16:00" (local time);
                               outside these, only refresh with the button
   issue_url                   e.g. "https://github.com/OWNER/REPO/issues/{}";
-                              links branches named NUMBER-... to that issue"""
+                              links branches named NUMBER-... to that issue
+  approval_org                e.g. "OWNER"; lists runs waiting for environment
+                              approval in repos of that org, below the bar"""
 
-WORKFLOW_HELP = "Bar on top: newest workflow run; blue running, green passed, red failed"
+WORKFLOW_HELP = ("Bar on top: newest workflow run; blue running, green passed, red failed\n"
+                 "Gray lines below it: runs waiting for environment approval")
 
 
 def run(args, cwd):
@@ -193,6 +199,54 @@ def load_issue_url():
         return tomllib.load(f).get("issue_url")
 
 
+def load_approval_org():
+    with CONFIG.open("rb") as f:
+        return tomllib.load(f).get("approval_org")
+
+
+def load_approval_repos(org):
+    """Return (repos, scan time) from the last scan of org, or ([], 0) if there is none."""
+    try:
+        cache = json.loads(APPROVAL_REPOS.read_text())
+    except (OSError, ValueError):
+        return [], 0
+    if cache.get("org") != org:
+        return [], 0
+    return cache["repos"], cache["scanned"]
+
+
+def needs_approval(repo):
+    """Return whether any environment of repo requires a reviewer."""
+    try:
+        envs = json.loads(run(["gh", "api", f"repos/{repo}/environments"], Path.cwd()))
+    except (RuntimeError, ValueError):
+        return False  # No access to environments, or none configured.
+    return any(rule["type"] == "required_reviewers"
+               for env in envs.get("environments", []) for rule in env.get("protection_rules", []))
+
+
+def scan_approval_repos(org):
+    """Save the repos of org with an environment that requires a reviewer."""
+    out = run(["gh", "repo", "list", org, "--limit", "1000", "--no-archived",
+               "--json", "nameWithOwner", "-q", ".[].nameWithOwner"], Path.cwd())
+    names = out.split()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        repos = [name for name, needed in zip(names, pool.map(needs_approval, names)) if needed]
+    APPROVAL_REPOS.write_text(json.dumps({"org": org, "scanned": time.time(), "repos": repos},
+                                         indent=2) + "\n")
+
+
+def waiting_runs(repo):
+    """Return (text, tag, url) for each run in repo waiting for environment approval."""
+    try:
+        runs = json.loads(run(["gh", "run", "list", "-R", repo, "--status", "waiting", "--json",
+                               "url,workflowName,headBranch,displayTitle"], Path.cwd()))
+    except (RuntimeError, ValueError) as e:
+        return [(f"{repo}: error: {e}", None, None)]
+    return [(f"{repo} {r['workflowName']} ({r['headBranch']}): {r['displayTitle']}", "waiting", r["url"])
+            for r in runs]
+
+
 def workflow_status(url):
     """Return (text, tag, url) for the newest run listed by a GitHub API workflow runs URL."""
     try:
@@ -298,6 +352,9 @@ class App:
         self.bar.pack(fill="x")
         self.workflows = []
         self.runs = []
+        self.approvals = []
+        self.approval_org = None
+        self.scanning = False
 
         self.tree = ttk.Treeview(root, columns=("dir", "branch", "prs", "comment"), show="headings")
         for col, label, width in (("dir", "Directory", 150), ("branch", "Branch", 300),
@@ -330,6 +387,7 @@ class App:
         self._check_comments()
 
     def _auto_refresh(self):
+        self._maybe_scan()
         if in_work_hours():
             self.refresh()
         self.root.after(REFRESH_MS, self._auto_refresh)
@@ -355,6 +413,26 @@ class App:
         dirs, rows = self.last
         self._show(dirs, [updated.get(path, row) for (_, path, _), row in zip(dirs, rows)], runs)
 
+    def _maybe_scan(self):
+        """Scan the org for repos needing approval if there is no scan yet, or at night
+        once the last scan is old."""
+        org = self.approval_org
+        if not org or self.scanning:
+            return
+        _, scanned = load_approval_repos(org)
+        if scanned and (time.time() - scanned < APPROVAL_SCAN_AGE or in_work_hours()):
+            return
+        self.scanning = True
+        threading.Thread(target=self._scan, args=(org,), daemon=True).start()
+
+    def _scan(self, org):
+        try:
+            scan_approval_repos(org)
+        except RuntimeError:
+            pass  # Retried on the next refresh.
+        self.scanning = False
+        self.root.after(0, self.refresh)
+
     def _check_comments(self):
         mtime = COMMENTS.stat().st_mtime if COMMENTS.exists() else None
         if mtime != self.comments_mtime:
@@ -373,16 +451,22 @@ class App:
             self.dirs = load_dirs()
             self.workflows = load_workflows()
             self.issue_url = load_issue_url()
+            self.approval_org = load_approval_org()
         except (OSError, ValueError, KeyError):
             pass  # Keep the last good config while the file is broken or mid-edit.
-        threading.Thread(target=self._fetch, args=(self.dirs, self.workflows), daemon=True).start()
+        self._maybe_scan()
+        approval_repos = load_approval_repos(self.approval_org)[0] if self.approval_org else []
+        threading.Thread(target=self._fetch, args=(self.dirs, self.workflows, approval_repos),
+                         daemon=True).start()
 
-    def _fetch(self, dirs, workflows):
+    def _fetch(self, dirs, workflows, approval_repos):
         with ThreadPoolExecutor() as pool:
             runs = pool.map(workflow_status, workflows)
+            waiting = pool.map(waiting_runs, approval_repos)
             rows = list(pool.map(status, dirs))
             runs = list(runs)
-        self.root.after(0, self._show, dirs, rows, runs)
+            approvals = [line for lines in waiting for line in lines]
+        self.root.after(0, self._show, dirs, rows, runs, approvals)
 
     def _show_colors(self):
         win = tk.Toplevel(self.root)
@@ -394,7 +478,7 @@ class App:
             tk.Label(win, text=meaning).grid(row=i, column=2, sticky="w", padx=6)
         tk.Label(win, text="No color: no PR, or on master/main", foreground="#555").grid(
             row=len(STATES), column=0, columnspan=3, sticky="w", padx=6, pady=(6, 0))
-        tk.Label(win, text=WORKFLOW_HELP, foreground="#555").grid(
+        tk.Label(win, text=WORKFLOW_HELP, foreground="#555", justify="left").grid(
             row=len(STATES) + 1, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
 
     def _toggle_hidden(self):
@@ -402,8 +486,10 @@ class App:
         self.toggle.configure(text="Hide idle" if self.show_all else "Show all")
         self._render()
 
-    def _show(self, dirs, rows, runs=None):
+    def _show(self, dirs, rows, runs=None, approvals=None):
         self.last = (dirs, rows)
+        if approvals is not None:
+            self.approvals = approvals
         if runs is not None:
             self.runs = runs
             self._render_bar()
@@ -415,7 +501,14 @@ class App:
         colors = {tag: color for tag, color, _, _ in STATES}
         for child in self.bar.winfo_children():
             child.destroy()
-        for text, tag, url in self.runs:
+        lines = list(self.runs)
+        if self.approvals:
+            lines += [None] + self.approvals  # None marks the separator.
+        for line in lines:
+            if line is None:
+                ttk.Separator(self.bar).pack(fill="x", pady=3)
+                continue
+            text, tag, url = line
             label = tk.Label(self.bar, text=text, anchor="w", padx=6,
                              background=colors.get(tag, self.bar.winfo_toplevel()["background"]))
             label.pack(fill="x")
