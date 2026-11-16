@@ -29,7 +29,7 @@ ACTIVE = {"running", "findings", "failed"}
 # Row colors in the order work usually goes through them: (tag, color, label, meaning).
 STATES = [
     ("running", "#9ec5fe", "Blue", "Review agent or CI checks are running"),
-    ("findings", "#ffb066", "Orange", "Review agent reported findings, or a review comment is unresolved"),
+    ("findings", "#ffb066", "Orange", "A review comment is unresolved"),
     ("failed", "#ff8a8a", "Red", "A CI check failed"),
     ("waiting", "#bdbdbd", "Gray", "Checks pass, review clean, waiting for approval"),
     ("approved", "#8fe39a", "Green", "PR approved"),
@@ -151,26 +151,24 @@ def load_review_agent():
 
 
 def review_state(pr, agent):
-    """Return "running", "findings" or None from the review agent's newest status comment.
+    """Return "running" or None from the review agent's newest status comment.
 
-    Findings posted before the latest commit are treated as addressed."""
+    Findings are tracked through their review threads, not the summary comment."""
     if agent is None:
         return None
     login, started = agent
-    last_commit = pr["commits"][-1]["committedDate"] if pr["commits"] else ""
     for c in reversed(pr["comments"]):
         if c["author"]["login"] != login:
             continue
         if started in c["body"]:
             return "running"
-        if m := FINDINGS.search(c["body"]):
-            # Both timestamps are UTC ISO 8601, so string comparison orders them.
-            return "findings" if int(m[1]) > 0 and c["createdAt"] > last_commit else None
+        if FINDINGS.search(c["body"]):
+            return None
     return None
 
 
 def pr_color(prs):
-    """Return the row tag: failed checks, review findings, review or checks
+    """Return the row tag: failed checks, unresolved review threads, review or checks
     running, approved, waiting for approval, in that order of precedence."""
     # CheckRun entries have status/conclusion; commit StatusContext entries have state.
     checks = [c for p in prs for c in p["statusCheckRollup"]]
@@ -178,7 +176,7 @@ def pr_color(prs):
     reviews = [review_state(p, agent) for p in prs]
     if any(c.get("conclusion") in FAILED or c.get("state") in FAILED for c in checks):
         return "failed"
-    if "findings" in reviews or any(not t["isResolved"] for p in prs for t in p["reviewThreads"]):
+    if any(not t["isResolved"] for p in prs for t in p["reviewThreads"]):
         return "findings"
     if "running" in reviews or any(
             c.get("status", "COMPLETED") != "COMPLETED" or c.get("state") in ("PENDING", "EXPECTED")
