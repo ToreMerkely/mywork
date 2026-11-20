@@ -582,7 +582,15 @@ class App:
             run(["git", "pull"], path)
         except RuntimeError as e:
             self.root.after(0, messagebox.showerror, "mywork", f"{path}\n\n{e}")
-        self.root.after(0, self.refresh)
+        self.root.after(0, self._refresh_when_idle)
+
+    def _refresh_when_idle(self):
+        """Refresh once no fetch is running, since a fetch started earlier may predate
+        the change it should show."""
+        if self.fetching:
+            self.root.after(500, self._refresh_when_idle)
+        else:
+            self.refresh()
 
     def _on_motion(self, event):
         self.tree.configure(cursor="hand2" if self._urls_at(event) else "")

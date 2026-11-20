@@ -63,4 +63,5 @@ mywork add [NAME]       add the current repo to the config
 mywork --help           show help
 ```
 
-Click a PR number to open it in the browser. Help → Colors explains the row colors.
+Click a PR number to open it in the browser. Right-click a purple row to check out the
+branch its PR merged into and pull. Help → Colors explains the row colors.
