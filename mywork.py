@@ -12,7 +12,7 @@ import tomllib
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from tkinter import font as tkfont, ttk
+from tkinter import font as tkfont, messagebox, ttk
 
 CONFIG = Path("~/.config/mywork/config.toml").expanduser()
 COMMENTS = CONFIG.parent / "comments.json"
@@ -78,7 +78,7 @@ query($owner: String!, $repo: String!, $branch: String!) {
   repository(owner: $owner, name: $repo) {
     pullRequests(headRefName: $branch, first: 1, orderBy: {field: CREATED_AT, direction: DESC}) {
       nodes {
-        number url state reviewDecision
+        number url state reviewDecision baseRefName
         comments(last: 100) { nodes { author { login } body createdAt } }
         reviewThreads(first: 100) { nodes { isResolved } }
         commits(last: 1) { nodes { commit {
@@ -111,25 +111,27 @@ def fetch_prs(branch, path):
 
 
 def status(repo):
+    """Return (row values, color tag, PR URLs, base branch of the merged PR or None)."""
     name, path, _ = repo
     comment = load_comments().get(str(path), "")
     try:
         branch = run(["git", "branch", "--show-current"], path) or "(detached)"
     except (RuntimeError, FileNotFoundError) as e:
-        return (name, "?", str(e), comment), None, []
+        return (name, "?", str(e), comment), None, [], None
     if branch in ("master", "main"):
-        return (name, branch, "–", comment), None, []
+        return (name, branch, "–", comment), None, [], None
     try:
         all_prs = fetch_prs(branch, path)
     except RuntimeError as e:
-        return (name, branch, f"error: {e}", comment), None, []
+        return (name, branch, f"error: {e}", comment), None, [], None
     prs = [p for p in all_prs if p["state"] == "OPEN"]
     merged = [p for p in all_prs if p["state"] == "MERGED"]
     if not prs and merged:
         pr_text = ", ".join(f"#{p['number']}" for p in merged)
-        return (name, branch, pr_text, comment), "merged", [p["url"] for p in merged]
+        return ((name, branch, pr_text, comment), "merged", [p["url"] for p in merged],
+                merged[0]["baseRefName"])
     pr_text = ", ".join(f"#{p['number']}" for p in prs) or "–"
-    return (name, branch, pr_text, comment), pr_color(prs), [p["url"] for p in prs]
+    return (name, branch, pr_text, comment), pr_color(prs), [p["url"] for p in prs], None
 
 
 FAILED = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
@@ -363,10 +365,12 @@ class App:
             self.tree.tag_configure(tag, background=color)
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<Button-1>", self._on_click)
+        self.tree.bind("<Button-3>", self._on_right_click)
         self.tree.bind("<Motion>", self._on_motion)
         self.tree.bind("<Leave>", lambda _: self._hide_tip())
         self.tip = self.tip_job = self.tip_cell = None
         self.urls = {}
+        self.bases = {}
         self.issue_url = None
 
         buttons = ttk.Frame(root)
@@ -392,7 +396,7 @@ class App:
 
     def _refresh_active(self):
         dirs, rows = self.last
-        active = [d for d, (_, color, _) in zip(dirs, rows) if color in ACTIVE]
+        active = [d for d, (_, color, _, _) in zip(dirs, rows) if color in ACTIVE]
         workflows = self.workflows if any(tag == "running" for _, tag, _ in self.runs) else None
         if (active or workflows) and not self.fetching and in_work_hours():
             self.fetching = True
@@ -519,12 +523,14 @@ class App:
     def _render(self):
         self.tree.delete(*self.tree.get_children())
         self.urls = {}
-        for (_, path, pinned), (row, color, urls) in zip(*self.last):
+        self.bases = {}
+        for (_, path, pinned), (row, color, urls, base) in zip(*self.last):
             if not (pinned or self.show_all) and row[1] in ("master", "main"):
                 continue
             tags = (color,) if color else ()
             self.tree.insert("", "end", iid=str(path), values=row, tags=tags)
             self.urls[str(path)] = urls
+            self.bases[str(path)] = base
 
     def _urls_at(self, event):
         """Return the URLs the cell under the pointer links to: its PRs, or the issue
@@ -540,6 +546,25 @@ class App:
     def _on_click(self, event):
         for url in self._urls_at(event):
             webbrowser.open(url)
+
+    def _on_right_click(self, event):
+        """On a merged row, offer to check out the branch the PR merged into."""
+        iid = self.tree.identify_row(event.y)
+        base = self.bases.get(iid)
+        if not base:
+            return
+        menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(label=f"Set to {base}", command=lambda: threading.Thread(
+            target=self._set_branch, args=(iid, base), daemon=True).start())
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _set_branch(self, path, base):
+        try:
+            run(["git", "checkout", base], path)
+            run(["git", "pull"], path)
+        except RuntimeError as e:
+            self.root.after(0, messagebox.showerror, "mywork", f"{path}\n\n{e}")
+        self.root.after(0, self.refresh)
 
     def _on_motion(self, event):
         self.tree.configure(cursor="hand2" if self._urls_at(event) else "")
