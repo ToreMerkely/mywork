@@ -84,14 +84,32 @@ query($owner: String!, $repo: String!, $branch: String!) {
         commits(last: 1) { nodes { commit {
           committedDate
           statusCheckRollup { contexts(first: 100) { nodes {
-            ... on StatusContext { state }
-            ... on CheckRun { status conclusion }
+            ... on StatusContext { state context createdAt }
+            ... on CheckRun {
+              status conclusion name startedAt
+              checkSuite { workflowRun { event workflow { name } } }
+            }
           } } }
         } } }
       }
     }
   }
 }"""
+
+
+def newest_checks(checks):
+    """Drop checks superseded by a rerun: a commit keeps every run of a check, so a
+    failed run would otherwise outlive the rerun that passed."""
+    newest = {}
+    for check in checks:
+        run_ = (check.get("checkSuite") or {}).get("workflowRun") or {}
+        key = (run_.get("workflow", {}).get("name"), run_.get("event"),
+               check.get("name") or check.get("context"))
+        # A run that has not started yet has no time, and is the newest.
+        started = check.get("startedAt") or check.get("createdAt") or "9"
+        if key not in newest or started >= newest[key][0]:
+            newest[key] = (started, check)
+    return [check for _, check in newest.values()]
 
 
 def fetch_prs(branch, path):
@@ -103,7 +121,7 @@ def fetch_prs(branch, path):
     for pr in prs:
         commits = [n["commit"] for n in pr["commits"]["nodes"]]
         rollup = commits[-1]["statusCheckRollup"] if commits else None
-        pr["statusCheckRollup"] = rollup["contexts"]["nodes"] if rollup else []
+        pr["statusCheckRollup"] = newest_checks(rollup["contexts"]["nodes"]) if rollup else []
         pr["comments"] = pr["comments"]["nodes"]
         pr["reviewThreads"] = pr["reviewThreads"]["nodes"]
         pr["commits"] = commits
